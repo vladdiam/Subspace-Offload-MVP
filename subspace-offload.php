@@ -54,10 +54,34 @@ function sso_settings_init() { //registers options names \/
     }, 'subspace-offload', 'sso_main_section' );
 }
 
-//=============== MODULE 2 : URL filtering & logic ===
-add_filter( 'wp_get_attachment_url', 'sso_maybe_offload_url', 10, 2 );//target attachment url hook, set priority to 10(def) and indicate 2 args
+//=============== MODULE 2 : URL filtering & logic (extended version) ===
 
-function sso_maybe_offload_url( $url, $post_id ) {
+//hook 1: direct url of ANY attachment (level 1 filter)
+add_filter( 'wp_get_attachment_url', 'sso_apply_cdn_replacement', 10, 1);//trigger our main fnctn of this module, when WP requests direct url of the file (img, video, doc). set priority to 10(def), 1 arg.
+
+//hook 2: if attachment is img (level 2 filter)
+add_filter( 'wp_get_attachment_image_src', function( $image ) {/* trigger anon fnctn if attachment is img & insert img data in this fnctn via $image variable*/
+    if ( $image ) {
+        $image[0] = sso_apply_cdn_replacement( $image[0] );// $image[0] is img's url
+    }
+    return $image;//return image array with new url
+}, 10, 1);
+
+//hook 3: image different sizes (srcsets) (level 3 filter)
+add_filter( 'wp_calculate_image_srcset', function( $sources ) {/* trigger anon fnctn when calculating srcsets for this image */
+    if ( is_array( $sources ) ) {//$sources is like a "box" with $images
+        foreach ( $sources as &$source ) {//iterate every image variant for this image
+            $source['url'] = sso_apply_cdn_replacement( $source['url'] );//replace url for this variant with new url
+        }
+    }
+    return $sources;//return all variants
+}, 10, 1);
+
+//hook 4: the final controller. Inspects all content after generating all shortcodes & etc.(level 4, the last)
+add_filter( 'the_content', 'sso_apply_cdn_replacement', 999, 1 );//999 priority makes it wait for all content, plugins shortcodes to be loaded
+
+
+function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-replacing.
     $cdn_url = get_option('sso_cdn_url');//get value from cdn-url field in admin & assign to this var
     $cutoff_date = get_option('sso_cutoff_date');//cutoff date field
 
@@ -65,19 +89,18 @@ function sso_maybe_offload_url( $url, $post_id ) {
         return $url;
     }
 
-    $post = get_post($post_id);//retrieve the object of this post (attachment)
-    if ( ! $post ) return $url;//returng og. url if is not found
+    $attachment_id = attachment_url_to_postid( $url );//find postid from url
     
-    $file_date = date( 'Y-m', strtotime( $post->post_date ) );//get post date & cut it to 2026-03 format 
-
-    if ( $file_date <= $cutoff_date ) {//if file date is older or equal to date in admin field, then \/
-        $upload_dir = wp_upload_dir();//get /uploads folder url
-        $base_url = $upload_dir['baseurl'];//get url of upload dir from upload_dir array
-
-        $url = str_replace( $base_url, untrailingslashit($cdn_url), $url );//replace url & erase the slash
+    if ( $attachment_id ) {//check if exists
+        $post = get_post( $attachment_id );//get "post" object of this attachment
+        $file_date = date( 'Y-m', strtotime( $post->post_date ) );//get post date & cut it to 2026-03 format 
+        if ( $file_date > $cutoff_date ) {//check if date is older
+            return $url;//return og. url if date isnt older
+        }
     }
 
-    return $url;//returns new value
-}
+    $base_url = untrailingslashit( wp_upload_dir()['baseurl'] );//get base url of local /uploads
+    $target_url = untrailingslashit( $cdn_url );//get base url of our cdn. all without slashes
 
-// MODULE IS WORKING. URL ARE REPLACING. BUT IMG'S ARE DISPLAYING ON SITE (HARDCODE, DIFF. SIZES)
+    return str_replace( $base_url, $target_url, $url );//replace url with cdn address
+}

@@ -1,0 +1,3 @@
+there are 2 ways to make this Plugin:
+1 - Dynamic. All actions are perfoming "on the fly" (our way).
+2 - Static. Requires DB changing, has some risks and irreversibility.
