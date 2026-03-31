@@ -113,6 +113,12 @@ function sso_ftp_set_init() {
         $val = get_option('sso_ftp_pass');
         echo '<input type="password" name="sso_ftp_pass" value="' . esc_attr($val) . '" class="regular-text" placeholder="****" autocomplete="off">';
     }, 'subspace-offload', 'sso_ftp_section');
+
+    // Server Path field
+    add_settings_field( 'sso_ftp_path', 'Server path', function(){ 
+        $val = get_option('sso_ftp_path');
+        echo '<input type="text" name="sso_ftp_path" value="' . esc_attr($val) . '" class="regular-text" placeholder="/oursite/uploads/2026/ (optional)" autocomplete="off">';
+    }, 'subspace-offload', 'sso_ftp_section');
 }
 
 //=============== MODULE 2 : URL filtering & logic (extended version) ===
@@ -174,17 +180,35 @@ function sso_handle_sync_ajax() {
         wp_send_json_error( array( 'message' => 'Security check failed!' ) );//send error msg & stop this fnctn via wp_die()
     }
 
-    $ftp_host = get_option('sso_ftp_host');//get ftp_host field from admin
-    $cutoff = get_option('sso_cutoff_date');//get cutoff date
+    $ftp_host = get_option('sso_ftp_host');// get our ftp data + server path
+    $ftp_user = get_option('sso_ftp_user');
+    $ftp_pass = get_option('sso_ftp_pass');
+    $ftp_root = get_option('sso_ftp_path', '/');
+    $ftp_path = untrailingslashit( trim($ftp_root) );// additional trim & slash deleting from path value
 
-    if ( empty($ftp_host) || empty($cutoff) ) {//if any field is empty, then \/
-        wp_send_json_error( array( 'message' => 'Fill FTP settings and Date first!' ) );//send error msg & stop this fnctn via wp_die()
+    if ( empty($ftp_host) || empty($ftp_user) || empty($ftp_pass)) {
+        wp_send_json_error( array( 'message' => 'FTP Credentials missing!' ) );
     }
 
-    wp_send_json_success( array(//send success msg
-        'message' => 'Connected to PHP! Ready to sync files older than ' . $cutoff,
-        'count'   => 42 // random number of files for Simulation of success
+    $conn_id = @ftp_connect($ftp_host); // connect to host via ftp 
+
+    if ( ! $conn_id ) {// if conn is empty, send error & wp_die()
+        wp_send_json_error( array( 'message' => "Could not connect to $ftp_host" ) );
+    }
+
+    $login_result = @ftp_login($conn_id, $ftp_user, $ftp_pass);// send our login data to ftp servers
+
+    if ( ! $login_result ) {// if smth wrong, close connection
+        ftp_close($conn_id);
+        wp_send_json_error( array( 'message' => 'FTP Login failed. Check user/pass.' ) );
+    }
+
+    ftp_pasv($conn_id, true);//set passive connection (for modern security requirements)
+
+    wp_send_json_success( array(//send success msg when conn is established 
+        'message' => 'Successfully connected to FTP! Login OK.',
     ));
 
-    wp_die(); //required in ajax-requests
+    ftp_close($conn_id); // after all actions close the connection
+    wp_die();// required in ajax-requests
 }
