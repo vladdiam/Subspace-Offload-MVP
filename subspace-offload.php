@@ -8,7 +8,8 @@
 
 if ( ! defined( 'ABSPATH' ) ) exit; //prevent direct entry via url
 
-add_action( 'admin_menu', 'sso_add_admin_menu' ); // ============== MODULE 1 : fields in admin & related ===
+// ============== MODULE 1-A: fields in admin & related ===
+add_action( 'admin_menu', 'sso_add_admin_menu' ); 
 function sso_add_admin_menu() {
     add_options_page(
         'Subspace Offload', //tab title
@@ -17,6 +18,19 @@ function sso_add_admin_menu() {
         'subspace-offload', //slug
         'sso_settings_page' //function name
     );
+    add_action( 'admin_enqueue_scripts', function( $hook ) {// setting nonce for this page & ajax
+        if ( $hook !== 'settings_page_subspace-offload' ) {
+            return;
+        }
+    
+        wp_localize_script(
+            'jquery',          
+            'sso_ajax',         
+            [
+                'nonce' => wp_create_nonce( 'sso_sync_nonce' ),
+            ]
+        );
+    } );
 }
 
 function sso_settings_page() {
@@ -25,9 +39,9 @@ function sso_settings_page() {
         <h1>Subspace Offload Options</h1>
         <form method="post" action="options.php">
             <?php
-            submit_button(); // save btn
             settings_fields( 'sso_settings_group' ); //secures your submitting (hidden fields), write once
             do_settings_sections( 'subspace-offload' ); //draw section with its fields
+            submit_button(); // save btn
             ?>
         </form>
 
@@ -57,11 +71,27 @@ function sso_settings_page() {
             statusBox.show();//show div with status
             log.text('Connecting to FTP and scanning files...');//set status text
 
-            // SIMULATION of success (imitation of successfull transfered files with 2sec timeout)
-            setTimeout(function() {
-                log.html('<span style="color: green;">Success! (Simulation)</span>. Found 15 files to move.');//success text
-                btn.attr('disabled', false).text('Start transfer');//return btn state to initial
-            }, 2000);
+            // ajax-connect
+            $.ajax({
+                url: ajaxurl, // вajax utilite
+                type: 'POST',
+                data: {
+                    action: 'sso_start_sync', // hook
+                    nonce: sso_ajax.nonce,    // nonce token
+                },
+                success: function( response ) {//on success
+                    if ( response.success ) {
+                        log.html( '<span style="color:green;">✔ ' + response.data.message + '</span>' );
+                    } else {
+                        log.html( '<span style="color:red;">✘ ' + response.data.message + '</span>' );
+                    }
+                    btn.attr( 'disabled', false ).text( 'Start transfer' );
+                },
+                error: function() {//on error
+                    log.html( '<span style="color:red;">✘ Server error. Try again.</span>' );
+                    btn.attr( 'disabled', false ).text( 'Start transfer' );
+                }
+            });
         });
     });
     </script>
@@ -72,6 +102,8 @@ add_action( 'admin_init', 'sso_settings_init' ); //add my vars when admin page i
 function sso_settings_init() { //registers options names \/
     register_setting( 'sso_settings_group', 'sso_cdn_url' ); //register this field in DB & put it in sso_settings_group group
     register_setting( 'sso_settings_group', 'sso_cutoff_date' );// 2nd field
+    register_setting( 'sso_settings_group', 'sso_ftp_path' );
+
 
     add_settings_section( 'sso_main_section'/*field name */, 'General settings', null, 'subspace-offload' ); //makes a section for opt.fields
 
@@ -121,6 +153,32 @@ function sso_ftp_set_init() {
     }, 'subspace-offload', 'sso_ftp_section');
 }
 
+//=============== MODULE 1-B : Setting of Transients (protects db from query overload) ===
+function sso_get_settings() {
+    $cached = get_transient( 'sso_settings_cache' );//get fields from cache
+    
+    if ( $cached !== false ) {
+        return $cached; // if cache exist -> return from cache
+    }
+
+    // if cache doesnt exist -> get opt. fields from db
+    $settings = [
+        'cdn_url'     => get_option( 'sso_cdn_url', '' ),
+        'cutoff_date' => get_option( 'sso_cutoff_date', '' ),
+    ];
+
+    set_transient( 'sso_settings_cache', $settings, 12 * HOUR_IN_SECONDS );//set transients from db fields for 12 hours
+
+    return $settings;
+}
+
+add_action( 'update_option_sso_cdn_url', 'sso_clear_settings_cache' );//refresh cache when user updates this field
+add_action( 'update_option_sso_cutoff_date', 'sso_clear_settings_cache' );
+
+function sso_clear_settings_cache() {//decribing the function for cache deleting
+    delete_transient( 'sso_settings_cache' );
+}
+
 //=============== MODULE 2 : URL filtering & logic (extended version) ===
 
 //hook 1: direct url of ANY attachment (level 1 filter)
@@ -145,12 +203,13 @@ add_filter( 'wp_calculate_image_srcset', function( $sources ) {/* trigger anon f
 }, 10, 1);
 
 //hook 4: the final controller. Inspects all content after generating all shortcodes & etc.(level 4, the last)
-add_filter( 'the_content', 'sso_apply_cdn_replacement', 999, 1 );//999 priority makes it wait for all content, plugins shortcodes to be loaded
+add_filter( 'the_content', 'sso_apply_cdn_to_content', 999, 1 );//999 priority makes it wait for all content, plugins shortcodes to be loaded
 
 
 function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-replacing.
-    $cdn_url = get_option('sso_cdn_url');//get value from cdn-url field in admin & assign to this var
-    $cutoff_date = get_option('sso_cutoff_date');//cutoff date field
+    $settings    = sso_get_settings();//retrieve fields from cache or db via module 1B fnctn
+    $cdn_url     = $settings['cdn_url'];
+    $cutoff_date = $settings['cutoff_date'];
 
     if ( empty($cdn_url) || empty($cutoff_date) ) {//if smth is empty, return original url
         return $url;
@@ -158,12 +217,21 @@ function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-rep
 
     $attachment_id = attachment_url_to_postid( $url );//find postid from url
     
-    if ( $attachment_id ) {//check if exists
-        $post = get_post( $attachment_id );//get "post" object of this attachment
-        $file_date = date( 'Y-m', strtotime( $post->post_date ) );//get post date & cut it to 2026-03 format 
-        if ( $file_date > $cutoff_date ) {//check if date is older
-            return $url;//return og. url if date isnt older
+    static $date_cache = []; // saves value via static during all query process
+
+    if ( ! isset( $date_cache[ $url ] ) ) {// check if result for this url exists
+        $attachment_id = attachment_url_to_postid( $url );//if URl isnt in cache -> sql search id
+    
+        if ( $attachment_id ) {//if object for this id exists
+            $post                  = get_post( $attachment_id );//retrieve date for id
+            $date_cache[ $url ]    = date( 'Y-m', strtotime( $post->post_date ) );//save & link date in cache
+        } else {
+            $date_cache[ $url ]    = null; //if isnt found - assign null value
         }
+    }
+    
+    if ( $date_cache[ $url ] && $date_cache[ $url ] > $cutoff_date ) {//if url (local) exists & date is more fresh than cutoff - return local url (no cdn)
+        return $url;
     }
 
     $base_url = untrailingslashit( wp_upload_dir()['baseurl'] );//get base url of local /uploads
@@ -172,12 +240,36 @@ function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-rep
     return str_replace( $base_url, $target_url, $url );//replace url with cdn address
 }
 
+function sso_apply_cdn_to_content( $content ) {//get all html content of the page
+    $settings    = sso_get_settings();//get fields
+    $cdn_url     = $settings['cdn_url'];
+    $cutoff_date = $settings['cutoff_date'];
+
+    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {//if plugin isnt setted up - return primary html content
+        return $content;
+    }
+
+    $base_url = untrailingslashit( wp_upload_dir()['baseurl'] );//get uploads url
+
+    return preg_replace_callback( //find ~, screening spec. symb., find all exc. 'xxx'
+        '~' . preg_quote( $base_url, '~' ) . '/[^\s"\'<>]+~',
+        function( $matches ) use ( $cutoff_date, $base_url, $cdn_url ) {//if content is url - apply fnctn 
+            return sso_apply_cdn_replacement( $matches[0] );
+        },
+        $content
+    );
+}
+
 //=============== MODULE 3 : FTP transfer (simulation) ===
 add_action( 'wp_ajax_sso_start_sync', 'sso_handle_sync_ajax' );//if you recieve ajax request with sso_start_sync action, trigger next fnctn
 
 function sso_handle_sync_ajax() {
     if ( ! current_user_can( 'manage_options' ) ) {//if user is not admin, then \/
         wp_send_json_error( array( 'message' => 'Security check failed!' ) );//send error msg & stop this fnctn via wp_die()
+    }
+
+    if ( ! check_ajax_referer( 'sso_sync_nonce', 'nonce', false ) ) {// check nonce token
+        wp_send_json_error( array( 'message' => 'Security check failed!' ) );
     }
 
     $ftp_host = get_option('sso_ftp_host');// get our ftp data + server path
