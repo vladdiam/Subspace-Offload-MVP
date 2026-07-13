@@ -18,20 +18,21 @@ function sso_add_admin_menu() {
         'subspace-offload', //slug
         'sso_settings_page' //function name
     );
-    add_action( 'admin_enqueue_scripts', function( $hook ) {// setting nonce for this page & ajax
-        if ( $hook !== 'settings_page_subspace-offload' ) {
-            return;
-        }
-    
-        wp_localize_script(
-            'jquery',          
-            'sso_ajax',         
-            [
-                'nonce' => wp_create_nonce( 'sso_sync_nonce' ),
-            ]
-        );
-    } );
 }
+
+add_action( 'admin_enqueue_scripts', function( $hook ) {// setting nonce for this page & ajax
+    if ( $hook !== 'settings_page_subspace-offload' ) {
+        return;
+    }
+
+    wp_localize_script(
+        'jquery',          
+        'sso_ajax',         
+        [
+            'nonce' => wp_create_nonce( 'sso_sync_nonce' ),
+        ]
+    );
+} );
 
 function sso_settings_page() {
     ?>
@@ -124,7 +125,12 @@ add_action( 'admin_init', 'sso_ftp_set_init' );//(3rd module) ftp section & fiel
 function sso_ftp_set_init() {
     register_setting( 'sso_settings_group', 'sso_ftp_host' );//register ftp-host field in DB
     register_setting( 'sso_settings_group', 'sso_ftp_user' );//reg. ftp-user
-    register_setting( 'sso_settings_group', 'sso_ftp_pass' );//reg. ftp pword
+    register_setting( 'sso_settings_group', 'sso_ftp_pass', [//reg. ftp pass w encryption
+        'sanitize_callback' => function( $value ) {
+            if ( empty( $value ) ) return get_option( 'sso_ftp_pass' ); // if field is empty - skip 
+            return sso_encrypt( $value );
+        }
+    ]);
 
     add_settings_section( 'sso_ftp_section'/*field name */, 'FTP Data', null, 'subspace-offload' );//add ftp data fields section
 
@@ -142,8 +148,7 @@ function sso_ftp_set_init() {
 
     // FTP pword field
     add_settings_field( 'sso_ftp_pass', 'Password', function(){ 
-        $val = get_option('sso_ftp_pass');
-        echo '<input type="password" name="sso_ftp_pass" value="' . esc_attr($val) . '" class="regular-text" placeholder="****" autocomplete="off">';
+        echo '<input type="password" name="sso_ftp_pass" value="" class="regular-text" placeholder="Leave blank to keep current" autocomplete="off">';
     }, 'subspace-offload', 'sso_ftp_section');
 
     // Server Path field
@@ -177,6 +182,22 @@ add_action( 'update_option_sso_cutoff_date', 'sso_clear_settings_cache' );
 
 function sso_clear_settings_cache() {//decribing the function for cache deleting
     delete_transient( 'sso_settings_cache' );
+}
+
+//=============== MODULE 1-C : encryption & decryption of ftp passwd ===
+function sso_encrypt( $value ) {
+    $key = wp_salt( 'auth' ); // use secret key from wp config
+    $iv  = openssl_random_pseudo_bytes( openssl_cipher_iv_length( 'AES-256-CBC' ) );
+    $encrypted = openssl_encrypt( $value, 'AES-256-CBC', $key, 0, $iv );
+    return base64_encode( $iv . '::' . $encrypted );
+}
+
+function sso_decrypt( $value ) {
+    $key   = wp_salt( 'auth' );
+    $parts = explode( '::', base64_decode( $value ), 2 );
+    if ( count( $parts ) !== 2 ) return ''; // if format isn't proper - return null
+    [ $iv, $encrypted ] = $parts;
+    return openssl_decrypt( $encrypted, 'AES-256-CBC', $key, 0, $iv );
 }
 
 //=============== MODULE 2 : URL filtering & logic (extended version) ===
@@ -214,8 +235,6 @@ function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-rep
     if ( empty($cdn_url) || empty($cutoff_date) ) {//if smth is empty, return original url
         return $url;
     }
-
-    $attachment_id = attachment_url_to_postid( $url );//find postid from url
     
     static $date_cache = []; // saves value via static during all query process
 
@@ -253,14 +272,14 @@ function sso_apply_cdn_to_content( $content ) {//get all html content of the pag
 
     return preg_replace_callback( //find ~, screening spec. symb., find all exc. 'xxx'
         '~' . preg_quote( $base_url, '~' ) . '/[^\s"\'<>]+~',
-        function( $matches ) use ( $cutoff_date, $base_url, $cdn_url ) {//if content is url - apply fnctn 
+        function( $matches ) {//if content is url - apply fnctn 
             return sso_apply_cdn_replacement( $matches[0] );
         },
         $content
     );
 }
 
-//=============== MODULE 3 : FTP transfer (simulation) ===
+//=============== MODULE 3-A : FTP conn setting ===
 add_action( 'wp_ajax_sso_start_sync', 'sso_handle_sync_ajax' );//if you recieve ajax request with sso_start_sync action, trigger next fnctn
 
 function sso_handle_sync_ajax() {
@@ -274,7 +293,7 @@ function sso_handle_sync_ajax() {
 
     $ftp_host = get_option('sso_ftp_host');// get our ftp data + server path
     $ftp_user = get_option('sso_ftp_user');
-    $ftp_pass = get_option('sso_ftp_pass');
+    $ftp_pass = sso_decrypt( get_option('sso_ftp_pass') );
     $ftp_root = get_option('sso_ftp_path', '/');
     $ftp_path = untrailingslashit( trim($ftp_root) );// additional trim & slash deleting from path value
 
@@ -297,10 +316,122 @@ function sso_handle_sync_ajax() {
 
     ftp_pasv($conn_id, true);//set passive connection (for modern security requirements)
 
-    wp_send_json_success( array(//send success msg when conn is established 
-        'message' => 'Successfully connected to FTP! Login OK.',
-    ));
+    // ============ MODULE 3-B : replace files to certain place on the server =======
+    $upload_dir  = wp_upload_dir();
+    $base_dir    = $upload_dir['basedir']; // uploads path
+    $cutoff_date = get_option( 'sso_cutoff_date' ); // get cutoff date
 
-    ftp_close($conn_id); // after all actions close the connection
-    wp_die();// required in ajax-requests
+    if ( empty( $cutoff_date ) ) {// if isnt set - close conn
+        ftp_close( $conn_id );
+        wp_send_json_error( array( 'message' => 'Cutoff date is not set!' ) );
+    }
+
+    // get all files which are older then date
+    $attachments = get_posts( array(
+        'post_type'      => 'attachment',   // only media & docs
+        'post_status'    => 'inherit',      // default status
+        'posts_per_page' => -1,             // w\out limits
+        'date_query'     => array(
+            array(
+                'column' => 'post_date',
+                'before' => $cutoff_date . '-01', // all before choosen month
+            ),
+        ),
+    ) );
+
+    $transferred = 0; // Counter - successful
+    $failed      = 0; // Counter - errors
+    $log         = []; // log array
+
+    foreach ( $attachments as $attachment ) {
+
+        // get all meta - file by itself & its miniatures
+        $meta          = wp_get_attachment_metadata( $attachment->ID );
+        $relative_file = get_post_meta( $attachment->ID, '_wp_attached_file', true ); // get path in uploads
+        $local_file    = $base_dir . '/' . $relative_file; // get full file path
+
+        // collect all files for transfering
+        $files_to_transfer = [];
+
+        if ( file_exists( $local_file ) ) {
+            $files_to_transfer[] = array(
+                'local'  => $local_file,
+                'remote' => $relative_file, // save exact path for ftp server
+            );
+        }
+
+        // process all file sizes (variants)
+        if ( ! empty( $meta['sizes'] ) ) {
+            $subdir = dirname( $relative_file ); // get subdir (/2024/03/)
+
+            foreach ( $meta['sizes'] as $size ) {
+                $local_thumb  = $base_dir . '/' . $subdir . '/' . $size['file'];
+                $remote_thumb = $subdir . '/' . $size['file'];
+    
+                if ( file_exists( $local_thumb ) ) {
+                    $files_to_transfer[] = array(
+                        'local'  => $local_thumb,
+                        'remote' => $remote_thumb,
+                    );
+                }
+            }
+        }
+
+        // transfer every file via ftp
+        $attachment_ok = true;
+
+        foreach ( $files_to_transfer as $file ) {
+            $remote_path = untrailingslashit( $ftp_path ) . '/' . $file['remote']; // exact full path on ftp serv.
+            $remote_dir  = dirname( $remote_path ); // subdir
+
+            // create subdir if does not exist
+            sso_ftp_mkdir_recursive( $conn_id, $remote_dir );
+
+            // put file to ftp server
+            $uploaded = ftp_put( $conn_id, $remote_path, $file['local'], FTP_BINARY );
+
+            if ( $uploaded ) {
+                @unlink( $file['local'] ); // if success -> delete local file
+            } else {
+                $attachment_ok = false;
+                $failed++;
+                $log[] = '✘ Failed: ' . $file['remote'];
+            }
+        }
+
+        if ( $attachment_ok && ! empty( $files_to_transfer ) ) {// +1 to Success
+            $transferred++;
+            $log[] = '✔ Transferred: ' . $relative_file;
+        }
+    }
+
+    ftp_close( $conn_id );//close ftp
+
+    $message = "Done. Transferred: $transferred, Failed: $failed.";//Summary of this translation
+    if ( ! empty( $log ) ) {
+        $message .= '<br><small>' . implode( '<br>', array_slice( $log, 0, 20 ) ) . '</small>'; // show first 20 status records
+    }
+
+    wp_send_json_success( array( 'message' => $message ) );
+    wp_die();
+}
+
+function sso_ftp_mkdir_recursive( $conn_id, $path ) {//fnctn for recursive creating of folders in ftp server
+    $parts   = explode( '/', ltrim( $path, '/' ) ); // divide path into parts
+    $current = '';
+
+    foreach ( $parts as $part ) {
+        if ( empty( $part ) ) continue;
+        $current .= '/' . $part;
+
+        // try "cd" command in ftp cerver for this folder
+        if ( @ftp_chdir( $conn_id, $current ) ) {
+            continue; // if success -> exit
+        }
+
+        @ftp_mkdir( $conn_id, $current ); // if unsucceed -> make directory
+    }
+
+    // after all - go to root 
+    @ftp_chdir( $conn_id, '/' );
 }
