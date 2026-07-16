@@ -60,41 +60,51 @@ function sso_settings_page() {
 
     <!-- ===JS script for confirming, disabling & status=== -->
     <script>
-    jQuery(document).ready(function($) {//do on full loaded DOM
-        $('#sso-sync-btn').on('click', function() {//event listener (click btn)
-            var btn = $(this);//this btn
-            var statusBox = $('#sso-sync-status');//div with status texts
-            var log = $('#sso-log-text');//status text
+    jQuery(document).ready(function($) {
+    $('#sso-sync-btn').on('click', function() {
+        var btn = $(this);
+        var statusBox = $('#sso-sync-status');
+        var log = $('#sso-log-text');
 
-            if(!confirm('Are you sure you want to start FTP sync?')) return;//if user click "cancel" -> stop fnctn
+        if(!confirm('Are you sure you want to start FTP sync?')) return;
 
-            btn.attr('disabled', true).text('Syncing...');//set btn state to Disabled & display syncing text
-            statusBox.show();//show div with status
-            log.text('Connecting to FTP and scanning files...');//set status text
+        btn.attr('disabled', true).text('Syncing...');
+        statusBox.show();
+        log.text('Connecting to FTP and scanning files...');
 
-            // ajax-connect
+        function runBatch( offset ) {
             $.ajax({
-                url: ajaxurl, // вajax utilite
+                url: ajaxurl,
                 type: 'POST',
                 data: {
-                    action: 'sso_start_sync', // hook
-                    nonce: sso_ajax.nonce,    // nonce token
+                    action: 'sso_start_sync',
+                    nonce: sso_ajax.nonce,
+                    offset: offset,
                 },
-                success: function( response ) {//on success
+                success: function( response ) {
                     if ( response.success ) {
-                        log.html( '<span style="color:green;">✔ ' + response.data.message + '</span>' );
+                        if ( response.data.has_more ) {
+                            log.html( '<span style="color:green;">✔ ' + response.data.message + ' Loading next batch...</span>' );
+                            runBatch( response.data.next_offset );
+                        } else {
+                            log.html( '<span style="color:green;">✔ All done! ' + response.data.message + '</span>' );
+                            btn.attr( 'disabled', false ).text( 'Start transfer' );
+                        }
                     } else {
                         log.html( '<span style="color:red;">✘ ' + response.data.message + '</span>' );
+                        btn.attr( 'disabled', false ).text( 'Start transfer' );
                     }
-                    btn.attr( 'disabled', false ).text( 'Start transfer' );
                 },
-                error: function() {//on error
+                error: function() {
                     log.html( '<span style="color:red;">✘ Server error. Try again.</span>' );
                     btn.attr( 'disabled', false ).text( 'Start transfer' );
                 }
             });
-        });
+        }
+
+        runBatch( 0 );
     });
+});
     </script>
     <?php
 }
@@ -104,6 +114,7 @@ function sso_settings_init() { //registers options names \/
     register_setting( 'sso_settings_group', 'sso_cdn_url' ); //register this field in DB & put it in sso_settings_group group
     register_setting( 'sso_settings_group', 'sso_cutoff_date' );// 2nd field
     register_setting( 'sso_settings_group', 'sso_ftp_path' );
+    register_setting( 'sso_settings_group', 'sso_batch_size' );//size of files batch
 
 
     add_settings_section( 'sso_main_section'/*field name */, 'General settings', null, 'subspace-offload' ); //makes a section for opt.fields
@@ -118,6 +129,19 @@ function sso_settings_init() { //registers options names \/
     add_settings_field( 'sso_cutoff_date', 'Max. cutoff date', function() {
         $val = get_option('sso_cutoff_date');
         echo '<input type="month" name="sso_cutoff_date" value="' . esc_attr($val) . '">';
+    }, 'subspace-offload', 'sso_main_section' );
+
+    // field for files batch dropdown
+    add_settings_field( 'sso_batch_size', 'Files per batch', function() {
+        $val = get_option( 'sso_batch_size', '20' ); // default 20
+        echo '<select name="sso_batch_size">
+            <option value="5"'   . selected($val, '5',   false) . '>5 - very safe (slower transfer)</option>
+            <option value="10"'  . selected($val, '10',  false) . '>10 - safe</option>
+            <option value="20"'  . selected($val, '20',  false) . '>20 - recommended</option>
+            <option value="50"'  . selected($val, '50',  false) . '>50 - fast</option>
+            <option value="100"' . selected($val, '100', false) . '>100 - fastest (greater load on the server)</option>
+        </select>
+        <p class="description">How many files to transfer per one request. Lower = safer, higher = faster.</p>';
     }, 'subspace-offload', 'sso_main_section' );
 }
 
@@ -198,6 +222,60 @@ function sso_decrypt( $value ) {
     if ( count( $parts ) !== 2 ) return ''; // if format isn't proper - return null
     [ $iv, $encrypted ] = $parts;
     return openssl_decrypt( $encrypted, 'AES-256-CBC', $key, 0, $iv );
+}
+
+//=============== MODULE 1-D : Media Library warnings ===
+
+// banner on top of Media Library page
+add_action( 'admin_notices', 'sso_admin_notice' );
+
+function sso_admin_notice(): void {
+    $screen = get_current_screen();
+    if ( ! $screen || $screen->id !== 'upload' ) {
+        return; // only on Media Library page
+    }
+
+    $settings    = sso_get_settings();
+    $cdn_url     = $settings['cdn_url'];
+    $cutoff_date = $settings['cutoff_date'];
+
+    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {
+        return; // plugin not configured — nothing to warn about
+    }
+    ?>
+    <div class="notice notice-warning">
+        <p>
+            <strong>Subspace Offload:</strong>
+            Files uploaded before <strong><?php echo esc_html( $cutoff_date ); ?></strong>
+            are being served from
+            <a href="<?php echo esc_url( $cdn_url ); ?>" target="_blank"><?php echo esc_html( $cdn_url ); ?></a>.
+        </p>
+    </div>
+    <?php
+}
+
+// warning badge under each offloaded attachment in grid view
+add_filter( 'wp_prepare_attachment_for_js', 'sso_attachment_js_notice', 10, 3 );
+
+function sso_attachment_js_notice( array $response, WP_Post $attachment, $meta ): array {
+
+    $settings    = sso_get_settings();
+    $cdn_url     = $settings['cdn_url'];
+    $cutoff_date = $settings['cutoff_date'];
+
+    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {
+        return $response;
+    }
+
+    // check file date against cutoff
+    $file_date = date( 'Y-m', strtotime( $attachment->post_date ) );
+
+    if ( $file_date < $cutoff_date ) {
+        // file is older than cutoff — likely on FTP
+        $response['caption'] = '⚠️ Served from remote storage: ' . esc_html( $cdn_url );
+    }
+
+    return $response;
 }
 
 //=============== MODULE 2 : URL filtering & logic (extended version) ===
@@ -327,17 +405,23 @@ function sso_handle_sync_ajax() {
     }
 
     // get all files which are older then date
+    $batch_size = (int) get_option( 'sso_batch_size', 20 );//get size of a batch
+    $offset     = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0; // which file is starting
+    
     $attachments = get_posts( array(
-        'post_type'      => 'attachment',   // only media & docs
-        'post_status'    => 'inherit',      // default status
-        'posts_per_page' => -1,             // w\out limits
+        'post_type'      => 'attachment',
+        'post_status'    => 'inherit',
+        'posts_per_page' => $batch_size, // batch size (limit for 1 transfer)
+        'offset'         => $offset,     // start/progress point
         'date_query'     => array(
             array(
                 'column' => 'post_date',
-                'before' => $cutoff_date . '-01', // all before choosen month
+                'before' => $cutoff_date . '-01',
             ),
         ),
     ) );
+    
+    $has_more = count( $attachments ) === $batch_size;
 
     $transferred = 0; // Counter - successful
     $failed      = 0; // Counter - errors
@@ -412,7 +496,11 @@ function sso_handle_sync_ajax() {
         $message .= '<br><small>' . implode( '<br>', array_slice( $log, 0, 20 ) ) . '</small>'; // show first 20 status records
     }
 
-    wp_send_json_success( array( 'message' => $message ) );
+    wp_send_json_success( array(
+        'message'     => $message,
+        'has_more'    => $has_more,
+        'next_offset' => $offset + $batch_size,
+    ) );
     wp_die();
 }
 
