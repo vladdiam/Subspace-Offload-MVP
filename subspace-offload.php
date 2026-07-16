@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Subspace Offload
  * Description: Offload media to a subdomain/CDN based on date.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Author: vladd_i_am
  */
 
@@ -50,6 +50,7 @@ function sso_settings_page() {
         <hr>
         <h2>Sync actions</h2>
         <p>This button starts transferring files older than the specified date to the target FTP server</p>
+        <p>If you are using Webp-express plugin, make sure all files are in /uploads folder</p>
         <button type="button" id="sso-sync-btn" class="button button-secondary">
             Start transfer
         </button>
@@ -249,6 +250,7 @@ function sso_admin_notice(): void {
             Files uploaded before <strong><?php echo esc_html( $cutoff_date ); ?></strong>
             are being served from
             <a href="<?php echo esc_url( $cdn_url ); ?>" target="_blank"><?php echo esc_html( $cdn_url ); ?></a>.
+            (View the file description)
         </p>
     </div>
     <?php
@@ -267,12 +269,12 @@ function sso_attachment_js_notice( array $response, WP_Post $attachment, $meta )
         return $response;
     }
 
-    // check file date against cutoff
-    $file_date = date( 'Y-m', strtotime( $attachment->post_date ) );
-
-    if ( $file_date < $cutoff_date ) {
-        // file is older than cutoff — likely on FTP
-        $response['caption'] = '⚠️ Served from remote storage: ' . esc_html( $cdn_url );
+    //check if file exists localy
+    $relative_path = get_post_meta( $attachment->ID, '_wp_attached_file', true );
+    $local_path    = wp_upload_dir()['basedir'] . '/' . $relative_path;
+    
+    if ( ! file_exists( $local_path ) ) {
+        $response['description'] = '⚠️ Served from FTP: ' . esc_html( $cdn_url );
     }
 
     return $response;
@@ -310,25 +312,25 @@ function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-rep
     $cdn_url     = $settings['cdn_url'];
     $cutoff_date = $settings['cutoff_date'];
 
-    if ( empty($cdn_url) || empty($cutoff_date) ) {//if smth is empty, return original url
+    if ( empty($cdn_url)) {//if empty, return original url
         return $url;
     }
     
-    static $date_cache = []; // saves value via static during all query process
+    static $date_cache = [];
 
-    if ( ! isset( $date_cache[ $url ] ) ) {// check if result for this url exists
-        $attachment_id = attachment_url_to_postid( $url );//if URl isnt in cache -> sql search id
+    if ( ! isset( $date_cache[ $url ] ) ) {
+        $upload_dir = wp_upload_dir();
+        $base_url   = untrailingslashit( $upload_dir['baseurl'] );
+        $base_dir   = untrailingslashit( $upload_dir['basedir'] );
     
-        if ( $attachment_id ) {//if object for this id exists
-            $post                  = get_post( $attachment_id );//retrieve date for id
-            $date_cache[ $url ]    = date( 'Y-m', strtotime( $post->post_date ) );//save & link date in cache
-        } else {
-            $date_cache[ $url ]    = null; //if isnt found - assign null value
-        }
+        // url to local path
+        $local_path = str_replace( $base_url, $base_dir, $url );
+        
+        $date_cache[ $url ] = file_exists( $local_path );
     }
     
-    if ( $date_cache[ $url ] && $date_cache[ $url ] > $cutoff_date ) {//if url (local) exists & date is more fresh than cutoff - return local url (no cdn)
-        return $url;
+    if ( $date_cache[ $url ] === true ) {
+        return $url; // return local if local exist
     }
 
     $base_url = untrailingslashit( wp_upload_dir()['baseurl'] );//get base url of local /uploads
@@ -340,9 +342,8 @@ function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-rep
 function sso_apply_cdn_to_content( $content ) {//get all html content of the page
     $settings    = sso_get_settings();//get fields
     $cdn_url     = $settings['cdn_url'];
-    $cutoff_date = $settings['cutoff_date'];
 
-    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {//if plugin isnt setted up - return primary html content
+    if ( empty( $cdn_url )) {//if plugin isnt setted up - return primary html content
         return $content;
     }
 
@@ -440,8 +441,15 @@ function sso_handle_sync_ajax() {
         if ( file_exists( $local_file ) ) {
             $files_to_transfer[] = array(
                 'local'  => $local_file,
-                'remote' => $relative_file, // save exact path for ftp server
+                'remote' => $relative_file,
             );
+            // check for webp companion file
+            if ( file_exists( $local_file . '.webp' ) ) {
+                $files_to_transfer[] = array(
+                    'local'  => $local_file . '.webp',
+                    'remote' => $relative_file . '.webp',
+                );
+            }
         }
 
         // process all file sizes (variants)
@@ -457,6 +465,13 @@ function sso_handle_sync_ajax() {
                         'local'  => $local_thumb,
                         'remote' => $remote_thumb,
                     );
+                    // check for webp companion file
+                    if ( file_exists( $local_thumb . '.webp' ) ) {
+                        $files_to_transfer[] = array(
+                            'local'  => $local_thumb . '.webp',
+                            'remote' => $remote_thumb . '.webp',
+                        );
+                    }
                 }
             }
         }
