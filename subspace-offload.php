@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: Subspace Offload
+ * Plugin Name: Subspace Offload MVP
  * Description: Offload media to a subdomain/CDN based on date.
  * Version: 0.2.0
  * Author: vladd_i_am
