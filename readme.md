@@ -148,8 +148,8 @@ This works for images, thumbnails, srcsets, PDFs, documents, and inline content.
 
 ## Changelog
 
-### 0.1.0
-- Initial release
+### 0.3.0
+- Initial release (edit. from S.S.O MVP)
 - Fully automatic transfer via WP-Cron — no manual action needed
 - Configurable local delay (hours) instead of fixed cutoff date
 - Configurable check interval (hourly / 12h / daily)
