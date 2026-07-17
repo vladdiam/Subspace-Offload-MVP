@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Subspace Offload
- * Description: Offload media to a subdomain/CDN based on date.
- * Version: 0.2.0
+ * Description: Automatically offloads media files to a remote FTP server (subdomain/CDN) via WP-Cron. Files are kept locally for a set number of hours, then transferred and served from the CDN — no manual action needed.
+ * Version: 0.3.0
  * Author: vladd_i_am
  */
 
@@ -20,20 +20,6 @@ function sso_add_admin_menu() {
     );
 }
 
-add_action( 'admin_enqueue_scripts', function( $hook ) {// setting nonce for this page & ajax
-    if ( $hook !== 'settings_page_subspace-offload' ) {
-        return;
-    }
-
-    wp_localize_script(
-        'jquery',          
-        'sso_ajax',         
-        [
-            'nonce' => wp_create_nonce( 'sso_sync_nonce' ),
-        ]
-    );
-} );
-
 function sso_settings_page() {
     ?>
     <div class="wrap"> <?php /*page render  \/*/?>
@@ -45,75 +31,14 @@ function sso_settings_page() {
             submit_button(); // save btn
             ?>
         </form>
-
-        <!-- //ftp sync btn (part of 3rd module) -->
-        <hr>
-        <h2>Sync actions</h2>
-        <p>This button starts transferring files older than the specified date to the target FTP server</p>
-        <p>If you are using Webp-express plugin, make sure all files are in /uploads folder</p>
-        <button type="button" id="sso-sync-btn" class="button button-secondary">
-            Start transfer
-        </button>
-        <div id="sso-sync-status" style="margin-top: 20px; padding: 10px; background: #fff; border: 1px solid #ccd0d4; display: none;">
-            <strong>Status:</strong> <span id="sso-log-text">Waiting...</span>
-        </div>
-    </div>
-
-    <!-- ===JS script for confirming, disabling & status=== -->
-    <script>
-    jQuery(document).ready(function($) {
-    $('#sso-sync-btn').on('click', function() {
-        var btn = $(this);
-        var statusBox = $('#sso-sync-status');
-        var log = $('#sso-log-text');
-
-        if(!confirm('Are you sure you want to start FTP sync?')) return;
-
-        btn.attr('disabled', true).text('Syncing...');
-        statusBox.show();
-        log.text('Connecting to FTP and scanning files...');
-
-        function runBatch( offset ) {
-            $.ajax({
-                url: ajaxurl,
-                type: 'POST',
-                data: {
-                    action: 'sso_start_sync',
-                    nonce: sso_ajax.nonce,
-                    offset: offset,
-                },
-                success: function( response ) {
-                    if ( response.success ) {
-                        if ( response.data.has_more ) {
-                            log.html( '<span style="color:green;">✔ ' + response.data.message + ' Loading next batch...</span>' );
-                            runBatch( response.data.next_offset );
-                        } else {
-                            log.html( '<span style="color:green;">✔ All done! ' + response.data.message + '</span>' );
-                            btn.attr( 'disabled', false ).text( 'Start transfer' );
-                        }
-                    } else {
-                        log.html( '<span style="color:red;">✘ ' + response.data.message + '</span>' );
-                        btn.attr( 'disabled', false ).text( 'Start transfer' );
-                    }
-                },
-                error: function() {
-                    log.html( '<span style="color:red;">✘ Server error. Try again.</span>' );
-                    btn.attr( 'disabled', false ).text( 'Start transfer' );
-                }
-            });
-        }
-
-        runBatch( 0 );
-    });
-});
-    </script>
     <?php
 }
 
 add_action( 'admin_init', 'sso_settings_init' ); //add my vars when admin page is inicial. (1st section)
 function sso_settings_init() { //registers options names \/
     register_setting( 'sso_settings_group', 'sso_cdn_url' ); //register this field in DB & put it in sso_settings_group group
-    register_setting( 'sso_settings_group', 'sso_cutoff_date' );// 2nd field
+    register_setting( 'sso_settings_group', 'sso_delay_hours' );// how long file will be in local storage
+    register_setting( 'sso_settings_group', 'sso_cron_interval' );// cron interval
     register_setting( 'sso_settings_group', 'sso_ftp_path' );
     register_setting( 'sso_settings_group', 'sso_batch_size' );//size of files batch
 
@@ -126,12 +51,6 @@ function sso_settings_init() { //registers options names \/
         echo '<input type="text" name="sso_cdn_url" value="' . esc_attr($val) . '" class="regular-text" placeholder="https://cdn.site.com">';
     }, 'subspace-offload', 'sso_main_section' /* place of inserting this field & value */);
 
-    // 2nd field
-    add_settings_field( 'sso_cutoff_date', 'Max. cutoff date', function() {
-        $val = get_option('sso_cutoff_date');
-        echo '<input type="month" name="sso_cutoff_date" value="' . esc_attr($val) . '">';
-    }, 'subspace-offload', 'sso_main_section' );
-
     // field for files batch dropdown
     add_settings_field( 'sso_batch_size', 'Files per batch', function() {
         $val = get_option( 'sso_batch_size', '20' ); // default 20
@@ -143,6 +62,30 @@ function sso_settings_init() { //registers options names \/
             <option value="100"' . selected($val, '100', false) . '>100 - fastest (greater load on the server)</option>
         </select>
         <p class="description">How many files to transfer per one request. Lower = safer, higher = faster.</p>';
+    }, 'subspace-offload', 'sso_main_section' );
+
+    // delay field
+    add_settings_field( 'sso_delay_hours', 'Local delay (hours)', function() {
+        $val = get_option( 'sso_delay_hours', '24' );
+        echo '<select name="sso_delay_hours">
+            <option value="6"'   . selected($val, '6',   false) . '>6 hours</option>
+            <option value="12"'  . selected($val, '12',  false) . '>12 hours</option>
+            <option value="24"'  . selected($val, '24',  false) . '>24 hours — recommended</option>
+            <option value="48"'  . selected($val, '48',  false) . '>48 hours</option>
+            <option value="72"'  . selected($val, '72',  false) . '>72 hours</option>
+        </select>
+        <p class="description">How long to keep files locally before transferring to FTP.</p>';
+    }, 'subspace-offload', 'sso_main_section' );
+
+    // cron interval field
+    add_settings_field( 'sso_cron_interval', 'Check interval', function() {
+        $val = get_option( 'sso_cron_interval', 'daily' );
+        echo '<select name="sso_cron_interval">
+            <option value="hourly"'     . selected($val, 'hourly',     false) . '>Every hour</option>
+            <option value="twicedaily"' . selected($val, 'twicedaily', false) . '>Every 12 hours</option>
+            <option value="daily"'      . selected($val, 'daily',      false) . '>Once a day — recommended</option>
+        </select>
+        <p class="description">How often WordPress checks for files ready to transfer.</p>';
     }, 'subspace-offload', 'sso_main_section' );
 }
 
@@ -194,7 +137,8 @@ function sso_get_settings() {
     // if cache doesnt exist -> get opt. fields from db
     $settings = [
         'cdn_url'     => get_option( 'sso_cdn_url', '' ),
-        'cutoff_date' => get_option( 'sso_cutoff_date', '' ),
+        'delay_hours'   => (int) get_option( 'sso_delay_hours', 24 ),
+        'cron_interval' => get_option( 'sso_cron_interval', 'daily' ),
     ];
 
     set_transient( 'sso_settings_cache', $settings, 12 * HOUR_IN_SECONDS );//set transients from db fields for 12 hours
@@ -203,7 +147,8 @@ function sso_get_settings() {
 }
 
 add_action( 'update_option_sso_cdn_url', 'sso_clear_settings_cache' );//refresh cache when user updates this field
-add_action( 'update_option_sso_cutoff_date', 'sso_clear_settings_cache' );
+add_action( 'update_option_sso_delay_hours', 'sso_clear_settings_cache' );
+add_action( 'update_option_sso_cron_interval', 'sso_clear_settings_cache' );
 
 function sso_clear_settings_cache() {//decribing the function for cache deleting
     delete_transient( 'sso_settings_cache' );
@@ -238,20 +183,20 @@ function sso_admin_notice(): void {
 
     $settings    = sso_get_settings();
     $cdn_url     = $settings['cdn_url'];
-    $cutoff_date = $settings['cutoff_date'];
+    $delay_hours = $settings['delay_hours'];
 
-    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {
+    if ( empty( $cdn_url )) {
         return; // plugin not configured — nothing to warn about
     }
     ?>
     <div class="notice notice-warning">
-        <p>
-            <strong>Subspace Offload:</strong>
-            Files uploaded before <strong><?php echo esc_html( $cutoff_date ); ?></strong>
-            are being served from
-            <a href="<?php echo esc_url( $cdn_url ); ?>" target="_blank"><?php echo esc_html( $cdn_url ); ?></a>.
-            (View the file description)
-        </p>
+    <p>
+        <strong>Subspace Offload:</strong>
+        Most files are being served from
+        <a href="<?php echo esc_url( $cdn_url ); ?>" target="_blank"><?php echo esc_html( $cdn_url ); ?></a>.
+        Files are transferred automatically after <?php echo esc_html( $delay_hours ); ?> hours.
+        (View the file description)
+    </p>
     </div>
     <?php
 }
@@ -263,9 +208,8 @@ function sso_attachment_js_notice( array $response, WP_Post $attachment, $meta )
 
     $settings    = sso_get_settings();
     $cdn_url     = $settings['cdn_url'];
-    $cutoff_date = $settings['cutoff_date'];
 
-    if ( empty( $cdn_url ) || empty( $cutoff_date ) ) {
+    if ( empty( $cdn_url )) {
         return $response;
     }
 
@@ -310,7 +254,6 @@ add_filter( 'the_content', 'sso_apply_cdn_to_content', 999, 1 );//999 priority m
 function sso_apply_cdn_replacement( $url ) {//main fnctn of this module. url-replacing.
     $settings    = sso_get_settings();//retrieve fields from cache or db via module 1B fnctn
     $cdn_url     = $settings['cdn_url'];
-    $cutoff_date = $settings['cutoff_date'];
 
     if ( empty($cdn_url)) {//if empty, return original url
         return $url;
@@ -358,167 +301,6 @@ function sso_apply_cdn_to_content( $content ) {//get all html content of the pag
     );
 }
 
-//=============== MODULE 3-A : FTP conn setting ===
-add_action( 'wp_ajax_sso_start_sync', 'sso_handle_sync_ajax' );//if you recieve ajax request with sso_start_sync action, trigger next fnctn
-
-function sso_handle_sync_ajax() {
-    if ( ! current_user_can( 'manage_options' ) ) {//if user is not admin, then \/
-        wp_send_json_error( array( 'message' => 'Security check failed!' ) );//send error msg & stop this fnctn via wp_die()
-    }
-
-    if ( ! check_ajax_referer( 'sso_sync_nonce', 'nonce', false ) ) {// check nonce token
-        wp_send_json_error( array( 'message' => 'Security check failed!' ) );
-    }
-
-    $ftp_host = get_option('sso_ftp_host');// get our ftp data + server path
-    $ftp_user = get_option('sso_ftp_user');
-    $ftp_pass = sso_decrypt( get_option('sso_ftp_pass') );
-    $ftp_root = get_option('sso_ftp_path', '/');
-    $ftp_path = untrailingslashit( trim($ftp_root) );// additional trim & slash deleting from path value
-
-    if ( empty($ftp_host) || empty($ftp_user) || empty($ftp_pass)) {
-        wp_send_json_error( array( 'message' => 'FTP Credentials missing!' ) );
-    }
-
-    $conn_id = @ftp_connect($ftp_host); // connect to host via ftp 
-
-    if ( ! $conn_id ) {// if conn is empty, send error & wp_die()
-        wp_send_json_error( array( 'message' => "Could not connect to $ftp_host" ) );
-    }
-
-    $login_result = @ftp_login($conn_id, $ftp_user, $ftp_pass);// send our login data to ftp servers
-
-    if ( ! $login_result ) {// if smth wrong, close connection
-        ftp_close($conn_id);
-        wp_send_json_error( array( 'message' => 'FTP Login failed. Check user/pass.' ) );
-    }
-
-    ftp_pasv($conn_id, true);//set passive connection (for modern security requirements)
-
-    // ============ MODULE 3-B : replace files to certain place on the server =======
-    $upload_dir  = wp_upload_dir();
-    $base_dir    = $upload_dir['basedir']; // uploads path
-    $cutoff_date = get_option( 'sso_cutoff_date' ); // get cutoff date
-
-    if ( empty( $cutoff_date ) ) {// if isnt set - close conn
-        ftp_close( $conn_id );
-        wp_send_json_error( array( 'message' => 'Cutoff date is not set!' ) );
-    }
-
-    // get all files which are older then date
-    $batch_size = (int) get_option( 'sso_batch_size', 20 );//get size of a batch
-    $offset     = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0; // which file is starting
-    
-    $attachments = get_posts( array(
-        'post_type'      => 'attachment',
-        'post_status'    => 'inherit',
-        'posts_per_page' => $batch_size, // batch size (limit for 1 transfer)
-        'offset'         => $offset,     // start/progress point
-        'date_query'     => array(
-            array(
-                'column' => 'post_date',
-                'before' => $cutoff_date . '-01',
-            ),
-        ),
-    ) );
-    
-    $has_more = count( $attachments ) === $batch_size;
-
-    $transferred = 0; // Counter - successful
-    $failed      = 0; // Counter - errors
-    $log         = []; // log array
-
-    foreach ( $attachments as $attachment ) {
-
-        // get all meta - file by itself & its miniatures
-        $meta          = wp_get_attachment_metadata( $attachment->ID );
-        $relative_file = get_post_meta( $attachment->ID, '_wp_attached_file', true ); // get path in uploads
-        $local_file    = $base_dir . '/' . $relative_file; // get full file path
-
-        // collect all files for transfering
-        $files_to_transfer = [];
-
-        if ( file_exists( $local_file ) ) {
-            $files_to_transfer[] = array(
-                'local'  => $local_file,
-                'remote' => $relative_file,
-            );
-            // check for webp companion file
-            if ( file_exists( $local_file . '.webp' ) ) {
-                $files_to_transfer[] = array(
-                    'local'  => $local_file . '.webp',
-                    'remote' => $relative_file . '.webp',
-                );
-            }
-        }
-
-        // process all file sizes (variants)
-        if ( ! empty( $meta['sizes'] ) ) {
-            $subdir = dirname( $relative_file ); // get subdir (/2024/03/)
-
-            foreach ( $meta['sizes'] as $size ) {
-                $local_thumb  = $base_dir . '/' . $subdir . '/' . $size['file'];
-                $remote_thumb = $subdir . '/' . $size['file'];
-    
-                if ( file_exists( $local_thumb ) ) {
-                    $files_to_transfer[] = array(
-                        'local'  => $local_thumb,
-                        'remote' => $remote_thumb,
-                    );
-                    // check for webp companion file
-                    if ( file_exists( $local_thumb . '.webp' ) ) {
-                        $files_to_transfer[] = array(
-                            'local'  => $local_thumb . '.webp',
-                            'remote' => $remote_thumb . '.webp',
-                        );
-                    }
-                }
-            }
-        }
-
-        // transfer every file via ftp
-        $attachment_ok = true;
-
-        foreach ( $files_to_transfer as $file ) {
-            $remote_path = untrailingslashit( $ftp_path ) . '/' . $file['remote']; // exact full path on ftp serv.
-            $remote_dir  = dirname( $remote_path ); // subdir
-
-            // create subdir if does not exist
-            sso_ftp_mkdir_recursive( $conn_id, $remote_dir );
-
-            // put file to ftp server
-            $uploaded = ftp_put( $conn_id, $remote_path, $file['local'], FTP_BINARY );
-
-            if ( $uploaded ) {
-                @unlink( $file['local'] ); // if success -> delete local file
-            } else {
-                $attachment_ok = false;
-                $failed++;
-                $log[] = '✘ Failed: ' . $file['remote'];
-            }
-        }
-
-        if ( $attachment_ok && ! empty( $files_to_transfer ) ) {// +1 to Success
-            $transferred++;
-            $log[] = '✔ Transferred: ' . $relative_file;
-        }
-    }
-
-    ftp_close( $conn_id );//close ftp
-
-    $message = "Done. Transferred: $transferred, Failed: $failed.";//Summary of this translation
-    if ( ! empty( $log ) ) {
-        $message .= '<br><small>' . implode( '<br>', array_slice( $log, 0, 20 ) ) . '</small>'; // show first 20 status records
-    }
-
-    wp_send_json_success( array(
-        'message'     => $message,
-        'has_more'    => $has_more,
-        'next_offset' => $offset + $batch_size,
-    ) );
-    wp_die();
-}
-
 function sso_ftp_mkdir_recursive( $conn_id, $path ) {//fnctn for recursive creating of folders in ftp server
     $parts   = explode( '/', ltrim( $path, '/' ) ); // divide path into parts
     $current = '';
@@ -537,4 +319,157 @@ function sso_ftp_mkdir_recursive( $conn_id, $path ) {//fnctn for recursive creat
 
     // after all - go to root 
     @ftp_chdir( $conn_id, '/' );
+}
+
+//=============== MODULE 3 : CRON & file transfer ===
+
+// register cron on plugin activation
+register_activation_hook( __FILE__, 'sso_cron_activate' );
+
+function sso_cron_activate() {
+    if ( ! wp_next_scheduled( 'sso_cron_transfer' ) ) {
+        $settings = sso_get_settings();
+        wp_schedule_event( time(), $settings['cron_interval'], 'sso_cron_transfer' );
+    }
+}
+
+// clear cron on plugin deactivation
+register_deactivation_hook( __FILE__, 'sso_cron_deactivate' );
+
+function sso_cron_deactivate() {
+    wp_clear_scheduled_hook( 'sso_cron_transfer' );
+}
+
+// reschedule cron when interval changes in settings
+add_action( 'update_option_sso_cron_interval', 'sso_cron_reschedule' );
+
+function sso_cron_reschedule() {
+    wp_clear_scheduled_hook( 'sso_cron_transfer' );
+    $settings = sso_get_settings();
+    wp_schedule_event( time(), $settings['cron_interval'], 'sso_cron_transfer' );
+}
+
+// hook cron event to transfer function
+add_action( 'sso_cron_transfer', 'sso_run_transfer' );
+
+function sso_run_transfer() {
+    $settings    = sso_get_settings();
+    $cdn_url     = $settings['cdn_url'];
+    $delay_hours = $settings['delay_hours'];
+
+    if ( empty( $cdn_url ) ) {
+        return; // plugin not configured — do nothing
+    }
+
+    // get ftp data
+    $ftp_host = get_option( 'sso_ftp_host' );
+    $ftp_user = get_option( 'sso_ftp_user' );
+    $ftp_pass = sso_decrypt( get_option( 'sso_ftp_pass' ) );
+    $ftp_root = get_option( 'sso_ftp_path', '/' );
+    $ftp_path = untrailingslashit( trim( $ftp_root ) );
+
+    if ( empty( $ftp_host ) || empty( $ftp_user ) || empty( $ftp_pass ) ) {
+        return; // ftp not configured — do nothing
+    }
+
+    // php connect to ftp
+    $conn_id = @ftp_connect( $ftp_host );
+    if ( ! $conn_id ) return;
+
+    $login = @ftp_login( $conn_id, $ftp_user, $ftp_pass );
+    if ( ! $login ) {
+        ftp_close( $conn_id );
+        return;
+    }
+
+    ftp_pasv( $conn_id, true );
+
+    // calculate cutoff time - files older than N hours
+    $cutoff_timestamp = time() - ( $delay_hours * HOUR_IN_SECONDS );
+    $cutoff_datetime  = date( 'Y-m-d H:i:s', $cutoff_timestamp ); // e.g. "2026-07-16 10:00:00"
+
+    $upload_dir = wp_upload_dir();
+    $base_dir   = $upload_dir['basedir'];
+    $batch_size = (int) get_option( 'sso_batch_size', 20 );
+    $offset     = 0;
+
+    // loop through batches until no files left
+    do {
+        $attachments = get_posts( array(
+            'post_type'      => 'attachment',
+            'post_status'    => 'inherit',
+            'posts_per_page' => $batch_size,
+            'offset'         => $offset,
+            'date_query'     => array(
+                array(
+                    'column' => 'post_date',
+                    'before' => $cutoff_datetime, // older than N hours
+                ),
+            ),
+        ) );
+
+        if ( empty( $attachments ) ) break;
+
+        foreach ( $attachments as $attachment ) {
+            $meta          = wp_get_attachment_metadata( $attachment->ID );
+            $relative_file = get_post_meta( $attachment->ID, '_wp_attached_file', true );
+            $local_file    = $base_dir . '/' . $relative_file;
+
+            $files_to_transfer = [];
+
+            // original file
+            if ( file_exists( $local_file ) ) {
+                $files_to_transfer[] = array(
+                    'local'  => $local_file,
+                    'remote' => $relative_file,
+                );
+                if ( file_exists( $local_file . '.webp' ) ) {
+                    $files_to_transfer[] = array(
+                        'local'  => $local_file . '.webp',
+                        'remote' => $relative_file . '.webp',
+                    );
+                }
+            }
+
+            // thumbnails
+            if ( ! empty( $meta['sizes'] ) ) {
+                $subdir = dirname( $relative_file );
+                foreach ( $meta['sizes'] as $size ) {
+                    $local_thumb  = $base_dir . '/' . $subdir . '/' . $size['file'];
+                    $remote_thumb = $subdir . '/' . $size['file'];
+
+                    if ( file_exists( $local_thumb ) ) {
+                        $files_to_transfer[] = array(
+                            'local'  => $local_thumb,
+                            'remote' => $remote_thumb,
+                        );
+                        if ( file_exists( $local_thumb . '.webp' ) ) {
+                            $files_to_transfer[] = array(
+                                'local'  => $local_thumb . '.webp',
+                                'remote' => $remote_thumb . '.webp',
+                            );
+                        }
+                    }
+                }
+            }
+
+            // transfer files
+            foreach ( $files_to_transfer as $file ) {
+                $remote_path = untrailingslashit( $ftp_path ) . '/' . $file['remote'];
+                $remote_dir  = dirname( $remote_path );
+
+                sso_ftp_mkdir_recursive( $conn_id, $remote_dir );
+
+                $uploaded = ftp_put( $conn_id, $remote_path, $file['local'], FTP_BINARY );
+                if ( $uploaded ) {
+                    @unlink( $file['local'] ); // delete local after success
+                }
+            }
+        }
+
+        $offset += $batch_size;
+
+    } while ( count( $attachments ) === $batch_size ); // continue if full batch
+
+    ftp_close( $conn_id );
 }
